@@ -13,6 +13,7 @@ use crate::{
     SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
 };
 use std::ops::DerefMut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
@@ -30,6 +31,7 @@ pub struct Stream {
     on_ended_closures: Vec<Arc<Closure<dyn FnMut()>>>,
     config: StreamConfig,
     buffer_size_frames: usize,
+    initial_play: AtomicBool,
 }
 
 pub type SupportedInputConfigs = ::std::vec::IntoIter<SupportedStreamConfigRange>;
@@ -397,6 +399,7 @@ impl DeviceTrait for Device {
             on_ended_closures,
             config: config.clone(),
             buffer_size_frames,
+            initial_play: AtomicBool::new(true),
         })
     }
 }
@@ -414,6 +417,10 @@ impl StreamTrait for Stream {
         let window = web_sys::window().unwrap();
         match self.ctx.resume() {
             Ok(_) => {
+                if !self.initial_play.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+
                 // Begin webaudio playback, initially scheduling the closures to fire on a timeout
                 // event.
                 let mut offset_ms = 10;
@@ -429,6 +436,7 @@ impl StreamTrait for Stream {
                         .unwrap();
                     offset_ms += time_step_ms;
                 }
+                self.initial_play.store(false, Ordering::Relaxed);
                 Ok(())
             }
             Err(err) => {
