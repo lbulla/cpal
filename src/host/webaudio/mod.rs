@@ -217,8 +217,8 @@ impl DeviceTrait for Device {
         let data_callback = Arc::new(Mutex::new(Box::new(data_callback)));
 
         // Create the WebAudio stream.
-        let mut stream_opts = AudioContextOptions::new();
-        stream_opts.sample_rate(config.sample_rate.0 as f32);
+        let stream_opts = AudioContextOptions::new();
+        stream_opts.set_sample_rate(config.sample_rate.0 as _);
         let ctx = AudioContext::new_with_context_options(&stream_opts).map_err(
             |err| -> BuildStreamError {
                 let description = format!("{:?}", err);
@@ -361,18 +361,21 @@ impl DeviceTrait for Device {
                     source
                         .connect_with_audio_node(&ctx_handle.destination())
                         .expect(
-                        "Unable to connect the web audio buffer source to the context destination",
-                    );
-                    source.set_onended(Some(
-                        on_ended_closure_handle
-                            .read()
-                            .unwrap()
-                            .as_ref()
-                            .unwrap()
-                            .as_ref()
-                            .unchecked_ref(),
-                    ));
-
+                            "Unable to connect the web audio buffer source to the context \
+                             destination",
+                        );
+                    source
+                        .add_event_listener_with_callback(
+                            "ended",
+                            on_ended_closure_handle
+                                .read()
+                                .unwrap()
+                                .as_ref()
+                                .unwrap()
+                                .as_ref()
+                                .unchecked_ref(),
+                        )
+                        .expect("Unable to add an 'ended' event listener to the buffer source");
                     source
                         .start_with_when(time_at_start_of_buffer)
                         .expect("Unable to start the webaudio buffer source");
