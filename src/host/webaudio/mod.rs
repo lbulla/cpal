@@ -4,7 +4,7 @@ extern crate web_sys;
 
 use self::wasm_bindgen::prelude::*;
 use self::wasm_bindgen::JsCast;
-use self::web_sys::{AudioContext, AudioContextOptions};
+use self::web_sys::{AudioBufferSourceNode, AudioContext, AudioContextOptions};
 use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::{
     BackendSpecificError, BufferSize, BuildStreamError, Data, DefaultStreamConfigError,
@@ -13,7 +13,7 @@ use crate::{
     SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
 };
 use std::ops::DerefMut;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 /// Content is false if the iterator is empty.
@@ -26,7 +26,8 @@ pub struct Host;
 
 pub struct Stream {
     ctx: Arc<AudioContext>,
-    on_ended_closures: Vec<Arc<RwLock<Option<Closure<dyn FnMut()>>>>>,
+    sources: Arc<RwLock<Vec<Option<AudioBufferSourceNode>>>>,
+    on_ended_closures: Vec<Arc<Closure<dyn FnMut()>>>,
     config: StreamConfig,
     buffer_size_frames: usize,
 }
@@ -43,6 +44,7 @@ const MIN_BUFFER_SIZE: u32 = 1;
 const MAX_BUFFER_SIZE: u32 = u32::MAX;
 const DEFAULT_BUFFER_SIZE: usize = 2048;
 const SUPPORTED_SAMPLE_FORMAT: SampleFormat = SampleFormat::F32;
+const NUM_CLOSURES: usize = 2;
 
 impl Host {
     pub fn new() -> Result<Self, crate::HostUnavailable> {
@@ -239,7 +241,8 @@ impl DeviceTrait for Device {
         let ctx = Arc::new(ctx);
 
         // A container for managing the lifecycle of the audio callbacks.
-        let mut on_ended_closures: Vec<Arc<RwLock<Option<Closure<dyn FnMut()>>>>> = Vec::new();
+        let mut on_ended_closures: Vec<Arc<Closure<dyn FnMut()>>> = Vec::new();
+        let sources = Arc::new(RwLock::new(vec![None; NUM_CLOSURES]));
 
         // A cursor keeping track of the current time at which new frames should be scheduled.
         let time = Arc::new(RwLock::new(0f64));
@@ -247,9 +250,10 @@ impl DeviceTrait for Device {
         // Create a set of closures / callbacks which will continuously fetch and schedule sample
         // playback. Starting with two workers, e.g. a front and back buffer so that audio frames
         // can be fetched in the background.
-        for _i in 0..2 {
+        for i in 0..NUM_CLOSURES {
             let data_callback_handle = data_callback.clone();
             let ctx_handle = ctx.clone();
+            let sources_handle = sources.clone();
             let time_handle = time.clone();
 
             // A set of temporary buffers to be used for intermediate sample transformation steps.
@@ -279,116 +283,117 @@ impl DeviceTrait for Device {
                     err.into()
                 })?;
 
-            // A self reference to this closure for passing to future audio event calls.
-            let on_ended_closure: Arc<RwLock<Option<Closure<dyn FnMut()>>>> =
-                Arc::new(RwLock::new(None));
-            let on_ended_closure_handle = on_ended_closure.clone();
-
-            on_ended_closure
-                .write()
-                .unwrap()
-                .replace(Closure::wrap(Box::new(move || {
-                    let now = ctx_handle.current_time();
-                    let time_at_start_of_buffer = {
-                        let time_at_start_of_buffer = time_handle
-                            .read()
-                            .expect("Unable to get a read lock on the time cursor");
-                        // Synchronise first buffer as necessary (eg. keep the time value
-                        // referenced to the context clock).
-                        if *time_at_start_of_buffer > 0.001 {
-                            *time_at_start_of_buffer
-                        } else {
-                            // 25ms of time to fetch the first sample data, increase to avoid
-                            // initial underruns.
-                            now + 0.025
-                        }
-                    };
-
-                    // Populate the sample data into an interleaved temporary buffer.
-                    {
-                        let len = temporary_buffer.len();
-                        let data = temporary_buffer.as_mut_ptr() as *mut ();
-                        let mut data = unsafe { Data::from_parts(data, len, sample_format) };
-                        let mut data_callback = data_callback_handle.lock().unwrap();
-                        let callback = crate::StreamInstant::from_secs_f64(now);
-                        let playback = crate::StreamInstant::from_secs_f64(time_at_start_of_buffer);
-                        let timestamp = crate::OutputStreamTimestamp { callback, playback };
-                        let info = OutputCallbackInfo { timestamp };
-                        (data_callback.deref_mut())(&mut data, &info);
-                    }
-
-                    // Deinterleave the sample data and copy into the audio context buffer.
-                    // We do not reference the audio context buffer directly e.g. getChannelData.
-                    // As wasm-bindgen only gives us a copy, not a direct reference.
-                    for channel in 0..n_channels {
-                        for i in 0..buffer_size_frames {
-                            temporary_channel_buffer[i] =
-                                temporary_buffer[n_channels * i + channel];
-                        }
-
-                        #[cfg(not(target_feature = "atomics"))]
-                        {
-                            ctx_buffer
-                                .copy_to_channel(&mut temporary_channel_buffer, channel as i32)
-                                .expect(
-                                    "Unable to write sample data into the audio context buffer",
-                                );
-                        }
-
-                        // copyToChannel cannot be directly copied into from a SharedArrayBuffer,
-                        // which WASM memory is backed by if the 'atomics' flag is enabled.
-                        // This workaround copies the data into an intermediary buffer first.
-                        // There's a chance browsers may eventually relax that requirement.
-                        // See this issue: https://github.com/WebAudio/web-audio-api/issues/2565
-                        #[cfg(target_feature = "atomics")]
-                        {
-                            temporary_channel_array_view.copy_from(&mut temporary_channel_buffer);
-                            ctx_buffer
-                                .unchecked_ref::<ExternalArrayAudioBuffer>()
-                                .copy_to_channel(&temporary_channel_array_view, channel as i32)
-                                .expect(
-                                    "Unable to write sample data into the audio context buffer",
-                                );
-                        }
-                    }
-
-                    // Create an AudioBufferSourceNode, schedule it to playback the reused buffer
-                    // in the future.
-                    let source = ctx_handle
-                        .create_buffer_source()
-                        .expect("Unable to create a webaudio buffer source");
-                    source.set_buffer(Some(&ctx_buffer));
-                    source
-                        .connect_with_audio_node(&ctx_handle.destination())
-                        .expect(
-                            "Unable to connect the web audio buffer source to the context \
-                             destination",
-                        );
-                    source
-                        .add_event_listener_with_callback(
-                            "ended",
-                            on_ended_closure_handle
+            let on_ended_closure = Arc::new_cyclic({
+                |on_ended_closure_handle: &Weak<Closure<dyn FnMut()>>| {
+                    let on_ended_closure_handle = on_ended_closure_handle.clone();
+                    Closure::new(move || {
+                        let now = ctx_handle.current_time();
+                        let time_at_start_of_buffer = {
+                            let time_at_start_of_buffer = time_handle
                                 .read()
-                                .unwrap()
-                                .as_ref()
-                                .unwrap()
-                                .as_ref()
-                                .unchecked_ref(),
-                        )
-                        .expect("Unable to add an 'ended' event listener to the buffer source");
-                    source
-                        .start_with_when(time_at_start_of_buffer)
-                        .expect("Unable to start the webaudio buffer source");
+                                .expect("Unable to get a read lock on the time cursor");
+                            // Synchronise first buffer as necessary (eg. keep the time value
+                            // referenced to the context clock).
+                            if *time_at_start_of_buffer > 0.001 {
+                                *time_at_start_of_buffer
+                            } else {
+                                // 25ms of time to fetch the first sample data, increase to avoid
+                                // initial underruns.
+                                now + 0.025
+                            }
+                        };
 
-                    // Keep track of when the next buffer worth of samples should be played.
-                    *time_handle.write().unwrap() = time_at_start_of_buffer + buffer_time_step_secs;
-                }) as Box<dyn FnMut()>));
+                        // Populate the sample data into an interleaved temporary buffer.
+                        {
+                            let len = temporary_buffer.len();
+                            let data = temporary_buffer.as_mut_ptr() as *mut ();
+                            let mut data = unsafe { Data::from_parts(data, len, sample_format) };
+                            let mut data_callback = data_callback_handle.lock().unwrap();
+                            let callback = crate::StreamInstant::from_secs_f64(now);
+                            let playback =
+                                crate::StreamInstant::from_secs_f64(time_at_start_of_buffer);
+                            let timestamp = crate::OutputStreamTimestamp { callback, playback };
+                            let info = OutputCallbackInfo { timestamp };
+                            (data_callback.deref_mut())(&mut data, &info);
+                        }
+
+                        // Deinterleave the sample data and copy into the audio context buffer.
+                        // We do not reference the audio context buffer directly e.g. getChannelData.
+                        // As wasm-bindgen only gives us a copy, not a direct reference.
+                        for channel in 0..n_channels {
+                            for i in 0..buffer_size_frames {
+                                temporary_channel_buffer[i] =
+                                    temporary_buffer[n_channels * i + channel];
+                            }
+
+                            #[cfg(not(target_feature = "atomics"))]
+                            {
+                                ctx_buffer
+                                    .copy_to_channel(&mut temporary_channel_buffer, channel as i32)
+                                    .expect(
+                                        "Unable to write sample data into the audio context buffer",
+                                    );
+                            }
+
+                            // copyToChannel cannot be directly copied into from a SharedArrayBuffer,
+                            // which WASM memory is backed by if the 'atomics' flag is enabled.
+                            // This workaround copies the data into an intermediary buffer first.
+                            // There's a chance browsers may eventually relax that requirement.
+                            // See this issue: https://github.com/WebAudio/web-audio-api/issues/2565
+                            #[cfg(target_feature = "atomics")]
+                            {
+                                temporary_channel_array_view
+                                    .copy_from(&mut temporary_channel_buffer);
+                                ctx_buffer
+                                    .unchecked_ref::<ExternalArrayAudioBuffer>()
+                                    .copy_to_channel(&temporary_channel_array_view, channel as i32)
+                                    .expect(
+                                        "Unable to write sample data into the audio context buffer",
+                                    );
+                            }
+                        }
+
+                        // Create an AudioBufferSourceNode, schedule it to playback the reused buffer
+                        // in the future.
+                        let source = ctx_handle
+                            .create_buffer_source()
+                            .expect("Unable to create a WebAudio buffer source");
+                        source.set_buffer(Some(&ctx_buffer));
+                        source
+                            .connect_with_audio_node(&ctx_handle.destination())
+                            .expect(
+                                "Unable to connect the web audio buffer source to the context \
+                                 destination",
+                            );
+                        source
+                            .add_event_listener_with_callback(
+                                "ended",
+                                on_ended_closure_handle
+                                    .upgrade()
+                                    .unwrap()
+                                    .as_ref()
+                                    .as_ref()
+                                    .unchecked_ref(),
+                            )
+                            .expect("Unable to add an 'ended' event listener to the buffer source");
+                        source
+                            .start_with_when(time_at_start_of_buffer)
+                            .expect("Unable to start the WebAudio buffer source");
+                        sources_handle.write().unwrap()[i].replace(source);
+
+                        // Keep track of when the next buffer worth of samples should be played.
+                        *time_handle.write().unwrap() =
+                            time_at_start_of_buffer + buffer_time_step_secs;
+                    })
+                }
+            });
 
             on_ended_closures.push(on_ended_closure);
         }
 
         Ok(Stream {
             ctx,
+            sources,
             on_ended_closures,
             config: config.clone(),
             buffer_size_frames,
@@ -418,13 +423,7 @@ impl StreamTrait for Stream {
                 for on_ended_closure in self.on_ended_closures.iter() {
                     window
                         .set_timeout_with_callback_and_timeout_and_arguments_0(
-                            on_ended_closure
-                                .read()
-                                .unwrap()
-                                .as_ref()
-                                .unwrap()
-                                .as_ref()
-                                .unchecked_ref(),
+                            on_ended_closure.as_ref().as_ref().unchecked_ref(),
                             offset_ms,
                         )
                         .unwrap();
@@ -455,6 +454,22 @@ impl StreamTrait for Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         let _ = self.ctx.close();
+
+        self.sources
+            .read()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .for_each(|(i, source)| {
+                if let Some(source) = source.as_ref() {
+                    source
+                        .remove_event_listener_with_callback(
+                            "ended",
+                            self.on_ended_closures[i].as_ref().as_ref().unchecked_ref(),
+                        )
+                        .unwrap()
+                }
+            });
     }
 }
 
