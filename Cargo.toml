@@ -75,12 +75,39 @@ objc2-core-audio-types = { version = "0.3.1", default-features = false, features
 wasm-bindgen = { version = "0.2.89" }
 wasm-bindgen-futures = "0.4.33"
 js-sys = { version = "0.3.35" }
-web-sys = { version = "0.3.35", features = [ "AudioContext", "AudioContextOptions", "AudioBuffer", "AudioBufferSourceNode", "AudioNode",  "AudioDestinationNode", "Window", "AudioContextState"] }
+web-sys = { version = "0.3.35", features = [
+    "AudioBuffer",
+    "AudioBufferSourceNode",
+    "AudioContext",
+    "AudioContextOptions",
+    "AudioContextState",
+    "AudioNode",
+    "AudioDestinationNode",
+    "Window",
+] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 wasm-bindgen = { version = "0.2.58", optional = true }
 js-sys = { version = "0.3.35" }
-web-sys = { version = "0.3.35", features = [ "AudioContext", "AudioContextOptions", "AudioBuffer", "AudioBufferSourceNode", "AudioNode",  "AudioDestinationNode", "Window", "AudioContextState"] }
+wasm-bindgen-futures = "0.4.50"
+web-sys = { version = "0.3.35", features = [
+    "AudioContext",
+    "AudioContextOptions",
+    "AudioDestinationNode",
+    "AudioNode",
+    "AudioWorklet",
+    "AudioWorkletNode",
+    "AudioWorkletNodeOptions",
+    "BlobPropertyBag",
+    "ChannelCountMode",
+    "MediaDevices",
+    "MediaStream",
+    "MediaStreamAudioSourceNode",
+    "MediaStreamConstraints",
+    "MediaTrackConstraints",
+    "MessagePort",
+    "Window",
+] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 ndk = { version = "0.9", default-features = false, features = ["audio", "api-level-26"]}

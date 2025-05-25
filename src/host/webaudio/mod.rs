@@ -2,20 +2,26 @@ extern crate js_sys;
 extern crate wasm_bindgen;
 extern crate web_sys;
 
+use self::js_sys::{global, Array, Float32Array, Reflect, SharedArrayBuffer};
 use self::wasm_bindgen::prelude::*;
 use self::wasm_bindgen::JsCast;
-use self::web_sys::{AudioBufferSourceNode, AudioContext, AudioContextOptions};
+use self::web_sys::{
+    window, AudioContext, AudioContextOptions, AudioWorkletNode, AudioWorkletNodeOptions, Blob,
+    BlobPropertyBag, MediaDevices, MediaStream, MediaStreamAudioSourceNode, MediaStreamConstraints,
+    MediaTrackConstraints, MessageEvent, Url,
+};
 use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::{
     BackendSpecificError, BufferSize, BuildStreamError, Data, DefaultStreamConfigError,
-    DeviceNameError, DevicesError, InputCallbackInfo, OutputCallbackInfo, PauseStreamError,
-    PlayStreamError, SampleFormat, SampleRate, StreamConfig, StreamError, SupportedBufferSize,
-    SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
+    DeviceNameError, DevicesError, InputCallbackInfo, InputStreamTimestamp, OutputCallbackInfo,
+    OutputStreamTimestamp, PauseStreamError, PlayStreamError, SampleFormat, SampleRate,
+    StreamConfig, StreamError, StreamInstant, SupportedBufferSize, SupportedStreamConfig,
+    SupportedStreamConfigRange, SupportedStreamConfigsError,
 };
-use std::ops::DerefMut;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 /// Content is false if the iterator is empty.
 pub struct Devices(bool);
@@ -26,27 +32,124 @@ pub struct Device;
 pub struct Host;
 
 pub struct Stream {
-    ctx: Arc<AudioContext>,
-    sources: Arc<RwLock<Vec<Option<AudioBufferSourceNode>>>>,
-    on_ended_closures: Vec<Arc<Closure<dyn FnMut()>>>,
-    config: StreamConfig,
-    buffer_size_frames: usize,
-    initial_play: AtomicBool,
+    inner: Rc<StreamInner>,
+}
+
+struct StreamInner {
+    ctx: Rc<AudioContext>,
+    stream_type: RefCell<Option<StreamType>>,
+}
+
+struct InputStream {
+    node: AudioWorkletNode,
+    _source: MediaStreamAudioSourceNode,
+    _on_process_closure: Closure<dyn FnMut(MessageEvent)>,
+}
+
+impl InputStream {
+    // Fixed, see: https://developer.mozilla.org/en-US/docs/Web/API/MediaStreamAudioSourceNode.
+    const NUM_CHANNELS: u16 = 2;
+
+    const PROCESSOR_NAME: &'static str = "web-input-processor";
+    const PROCESSOR_CODE: &'static str = r#"
+class WebInputProcessor extends AudioWorkletProcessor {
+    constructor(options) {
+        super(options);
+        this.buffer = options.processorOptions.buffer;
+        this.samplesWritten = 0;
+    }
+
+    process(inputs, outputs, parameters) {
+        for (let s = 0; s < inputs[0][0].length; s++) {
+            for (let c = 0; c < inputs[0].length; c++) {
+                this.buffer[this.samplesWritten] = inputs[0][c][s];
+                this.samplesWritten += 1;
+            }
+            if (this.samplesWritten >= this.buffer.length) {
+                this.port.postMessage(0);
+                this.samplesWritten = 0;
+            }
+        }
+        return true;
+    }
+}
+
+registerProcessor('web-input-processor', WebInputProcessor);
+"#;
+}
+
+struct OutputStream {
+    node: AudioWorkletNode,
+    _on_process_closure: Closure<dyn FnMut(MessageEvent)>,
+}
+
+impl OutputStream {
+    const MIN_CHANNELS: u16 = 1;
+    const MAX_CHANNELS: u16 = 32;
+
+    const PROCESSOR_NAME: &'static str = "web-output-processor";
+    const PROCESSOR_CODE: &'static str = r#"
+class WebOutputProcessor extends AudioWorkletProcessor {
+    constructor(options) {
+        super(options);
+        this.buffer = options.processorOptions.buffer;
+        this.samplesRead = 0;
+        this.port.postMessage(0);
+    }
+
+    process(inputs, outputs, parameters) {
+        for (let s = 0; s < outputs[0][0].length; s++) {
+            for (let c = 0; c < outputs[0].length; c++) {
+                outputs[0][c][s] = this.buffer[this.samplesRead];
+                this.samplesRead += 1;
+                if (this.samplesRead >= this.buffer.length) {
+                    this.port.postMessage(0);
+                    this.samplesRead = 0;
+                }
+            }
+        }
+        return true;
+    }
+}
+
+registerProcessor('web-output-processor', WebOutputProcessor);
+"#;
+}
+
+// Only used as storage to handle WebAudio's async nature.
+#[allow(unused)]
+enum StreamType {
+    Input(InputStream),
+    Output(OutputStream),
+}
+
+struct BufferSizes {
+    frames: usize,
+    samples: usize,
+    secs: f64,
+}
+
+struct ClosureParams {
+    buffer: Float32Array,
+    temp_buffer: Vec<f32>,
+    js_buffer_factor: usize,
+    buffer_size_secs: f64,
+    time_at_start_of_buffer: f64,
 }
 
 pub type SupportedInputConfigs = ::std::vec::IntoIter<SupportedStreamConfigRange>;
 pub type SupportedOutputConfigs = ::std::vec::IntoIter<SupportedStreamConfigRange>;
 
-const MIN_CHANNELS: u16 = 1;
-const MAX_CHANNELS: u16 = 32;
 const MIN_SAMPLE_RATE: SampleRate = SampleRate(8_000);
 const MAX_SAMPLE_RATE: SampleRate = SampleRate(96_000);
 const DEFAULT_SAMPLE_RATE: SampleRate = SampleRate(44_100);
 const MIN_BUFFER_SIZE: u32 = 1;
 const MAX_BUFFER_SIZE: u32 = u32::MAX;
 const DEFAULT_BUFFER_SIZE: usize = 2048;
+// The buffer size processors are currently limited to 128.
+// See: https://developer.mozilla.org/en-US/docs/Web/API/AudioWorkletProcessor/process.
+const WORKLET_BUFFER_SIZE: usize = 128;
 const SUPPORTED_SAMPLE_FORMAT: SampleFormat = SampleFormat::F32;
-const NUM_CLOSURES: usize = 2;
 
 impl Host {
     pub fn new() -> Result<Self, crate::HostUnavailable> {
@@ -59,7 +162,7 @@ impl HostTrait for Host {
     type Device = Device;
 
     fn is_available() -> bool {
-        // Assume this host is always available on webaudio.
+        // Assume this host is always available on WebAudio.
         true
     }
 
@@ -92,8 +195,17 @@ impl Device {
     fn supported_input_configs(
         &self,
     ) -> Result<SupportedInputConfigs, SupportedStreamConfigsError> {
-        // TODO
-        Ok(Vec::new().into_iter())
+        let configs = vec![SupportedStreamConfigRange::new(
+            InputStream::NUM_CHANNELS,
+            MIN_SAMPLE_RATE,
+            MAX_SAMPLE_RATE,
+            SupportedBufferSize::Range {
+                min: MIN_BUFFER_SIZE,
+                max: MAX_BUFFER_SIZE,
+            },
+            SUPPORTED_SAMPLE_FORMAT,
+        )];
+        Ok(configs.into_iter())
     }
 
     #[inline]
@@ -104,7 +216,7 @@ impl Device {
             min: MIN_BUFFER_SIZE,
             max: MAX_BUFFER_SIZE,
         };
-        let configs: Vec<_> = (MIN_CHANNELS..=MAX_CHANNELS)
+        let configs: Vec<_> = (OutputStream::MIN_CHANNELS..=OutputStream::MAX_CHANNELS)
             .map(|channels| SupportedStreamConfigRange {
                 channels,
                 min_sample_rate: MIN_SAMPLE_RATE,
@@ -118,13 +230,20 @@ impl Device {
 
     #[inline]
     fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        // TODO
-        Err(DefaultStreamConfigError::StreamTypeNotSupported)
+        const EXPECT: &str = "expected at least one valid WebAudio stream config";
+        let config = self
+            .supported_input_configs()
+            .expect(EXPECT)
+            .max_by(|a, b| a.cmp_default_heuristics(b))
+            .unwrap()
+            .with_sample_rate(DEFAULT_SAMPLE_RATE);
+
+        Ok(config)
     }
 
     #[inline]
     fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        const EXPECT: &str = "expected at least one valid webaudio stream config";
+        const EXPECT: &str = "expected at least one valid WebAudio stream config";
         let config = self
             .supported_output_configs()
             .expect(EXPECT)
@@ -133,6 +252,90 @@ impl Device {
             .with_sample_rate(DEFAULT_SAMPLE_RATE);
 
         Ok(config)
+    }
+
+    fn buffer_sizes(config: &StreamConfig) -> Result<BufferSizes, BuildStreamError> {
+        let frames = match config.buffer_size {
+            BufferSize::Fixed(v) => {
+                if v == 0 {
+                    return Err(BuildStreamError::StreamConfigNotSupported);
+                } else {
+                    v as usize
+                }
+            }
+            BufferSize::Default => DEFAULT_BUFFER_SIZE,
+        };
+        let samples = frames * config.channels as usize;
+        let secs = buffer_time_step_secs(frames, config.sample_rate);
+
+        Ok(BufferSizes {
+            frames,
+            samples,
+            secs,
+        })
+    }
+
+    fn create_inner(config: &StreamConfig) -> Result<Rc<StreamInner>, JsValue> {
+        let stream_opts = AudioContextOptions::new();
+        stream_opts
+            .set_latency_hint(&(WORKLET_BUFFER_SIZE as f32 / config.sample_rate.0 as f32).into());
+        stream_opts.set_sample_rate(config.sample_rate.0 as _);
+        let ctx = AudioContext::new_with_context_options(&stream_opts)?;
+
+        Ok(Rc::new(StreamInner {
+            ctx: Rc::new(ctx),
+            stream_type: RefCell::new(None),
+        }))
+    }
+
+    async fn create_node(
+        ctx: &AudioContext,
+        buffer_sizes: &BufferSizes,
+        n_channels: usize,
+        processor_name: &'static str,
+        processor_code: &'static str,
+    ) -> Result<(AudioWorkletNode, ClosureParams), JsValue> {
+        let blob_parts = Array::new();
+        blob_parts.push(&processor_code.into());
+        let blob_parts = JsValue::from(blob_parts);
+        let blob_options = BlobPropertyBag::new();
+        blob_options.set_type("application/javascript");
+        let blob = Blob::new_with_str_sequence_and_options(&blob_parts, &blob_options)?;
+        let url = Url::create_object_url_with_blob(&blob)?;
+
+        let module = ctx.audio_worklet()?.add_module(&url)?;
+        JsFuture::from(module).await?;
+        Url::revoke_object_url(&url)?;
+
+        let mut buffer_size_js = buffer_sizes.frames.max(WORKLET_BUFFER_SIZE) * n_channels;
+        let js_buffer_factor =
+            (buffer_size_js as f32 / buffer_sizes.samples as f32).ceil() as usize;
+        if js_buffer_factor != 1 {
+            buffer_size_js = buffer_sizes.samples * js_buffer_factor;
+        }
+        let buffer = Float32Array::new(&SharedArrayBuffer::new(
+            (buffer_size_js * size_of::<f32>()) as _,
+        ));
+
+        let options = AudioWorkletNodeOptions::new();
+        let object = js_sys::Object::new();
+        Reflect::set(&object, &"buffer".into(), &buffer)?;
+        options.set_processor_options(Some(&object));
+        let node = AudioWorkletNode::new_with_options(ctx, processor_name, &options)?;
+
+        let temp_buffer = vec![0.0; buffer_sizes.samples];
+        let time_at_start_of_buffer = 0.0;
+
+        Ok((
+            node,
+            ClosureParams {
+                buffer,
+                temp_buffer,
+                js_buffer_factor,
+                buffer_size_secs: buffer_sizes.secs,
+                time_at_start_of_buffer,
+            },
+        ))
     }
 }
 
@@ -172,18 +375,133 @@ impl DeviceTrait for Device {
 
     fn build_input_stream_raw<D, E>(
         &self,
-        _config: &StreamConfig,
-        _sample_format: SampleFormat,
-        _data_callback: D,
-        _error_callback: E,
+        config: &StreamConfig,
+        sample_format: SampleFormat,
+        mut data_callback: D,
+        mut error_callback: E,
         _timeout: Option<Duration>,
     ) -> Result<Self::Stream, BuildStreamError>
     where
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
-        // TODO
-        Err(BuildStreamError::StreamConfigNotSupported)
+        if !valid_input_config(config, sample_format) {
+            return Err(BuildStreamError::StreamConfigNotSupported);
+        }
+
+        let n_channels = config.channels as usize;
+        let buffer_sizes = Self::buffer_sizes(config)?;
+        let inner = Self::create_inner(config).map_err(map_err::<BuildStreamError>)?;
+
+        spawn_local({
+            let inner = inner.clone();
+            async move {
+                let input_stream = async {
+                    let devices = devices()?;
+
+                    let web_stream_constraints = MediaStreamConstraints::new();
+                    let track_constraints = MediaTrackConstraints::new();
+                    // TODO: Settings for these?
+                    track_constraints.set_auto_gain_control(&false.into());
+                    track_constraints.set_echo_cancellation(&false.into());
+                    track_constraints.set_noise_suppression(&false.into());
+                    web_stream_constraints.set_audio(&track_constraints.into());
+
+                    let web_stream =
+                        devices.get_user_media_with_constraints(&web_stream_constraints)?;
+                    let web_stream = JsFuture::from(web_stream);
+                    let web_stream = web_stream.await?;
+                    let web_stream = web_stream.unchecked_ref::<MediaStream>();
+                    let _source = inner.ctx.create_media_stream_source(&web_stream)?;
+
+                    let (node, mut params) = Self::create_node(
+                        &inner.ctx,
+                        &buffer_sizes,
+                        n_channels,
+                        InputStream::PROCESSOR_NAME,
+                        InputStream::PROCESSOR_CODE,
+                    )
+                    .await?;
+
+                    let ctx = inner.ctx.clone();
+                    let _on_process_closure = if params.js_buffer_factor == 1 {
+                        Closure::new(move |_: MessageEvent| {
+                            let now = ctx.current_time();
+
+                            params.buffer.copy_to(&mut params.temp_buffer);
+
+                            let data = unsafe {
+                                Data::from_parts(
+                                    params.temp_buffer.as_mut_ptr() as _,
+                                    params.temp_buffer.len(),
+                                    sample_format,
+                                )
+                            };
+                            let callback = StreamInstant::from_secs_f64(now);
+                            let capture =
+                                StreamInstant::from_secs_f64(params.time_at_start_of_buffer);
+                            let timestamp = InputStreamTimestamp { callback, capture };
+                            let info = InputCallbackInfo::new(timestamp);
+                            data_callback(&data, &info);
+
+                            params.time_at_start_of_buffer += params.buffer_size_secs;
+                        })
+                    } else {
+                        Closure::new(move |_: MessageEvent| {
+                            let mut now = ctx.current_time();
+
+                            let data = unsafe {
+                                Data::from_parts(
+                                    params.temp_buffer.as_mut_ptr() as _,
+                                    params.temp_buffer.len(),
+                                    sample_format,
+                                )
+                            };
+
+                            for i in 0..params.js_buffer_factor {
+                                params
+                                    .buffer
+                                    .subarray(
+                                        (i * params.temp_buffer.len()) as _,
+                                        ((i + 1) * params.temp_buffer.len()) as _,
+                                    )
+                                    .copy_to(&mut params.temp_buffer);
+
+                                let callback = StreamInstant::from_secs_f64(now);
+                                let capture =
+                                    StreamInstant::from_secs_f64(params.time_at_start_of_buffer);
+                                let timestamp = InputStreamTimestamp { callback, capture };
+                                let info = InputCallbackInfo::new(timestamp);
+                                data_callback(&data, &info);
+
+                                now += params.buffer_size_secs;
+                                params.time_at_start_of_buffer += params.buffer_size_secs;
+                            }
+                        })
+                    };
+                    node.port()?
+                        .set_onmessage(Some(_on_process_closure.as_ref().unchecked_ref()));
+                    _source.connect_with_audio_node(&node)?;
+
+                    Ok(InputStream {
+                        node,
+                        _source,
+                        _on_process_closure,
+                    })
+                };
+
+                match input_stream.await {
+                    Ok(s) => {
+                        inner.stream_type.replace(Some(StreamType::Input(s)));
+                    }
+                    Err(err) => {
+                        error_callback(map_err(err));
+                    }
+                }
+            }
+        });
+
+        Ok(Stream { inner })
     }
 
     /// Create an output stream.
@@ -191,216 +509,123 @@ impl DeviceTrait for Device {
         &self,
         config: &StreamConfig,
         sample_format: SampleFormat,
-        data_callback: D,
-        _error_callback: E,
+        mut data_callback: D,
+        mut error_callback: E,
         _timeout: Option<Duration>,
     ) -> Result<Self::Stream, BuildStreamError>
     where
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
-        if !valid_config(config, sample_format) {
+        if !valid_output_config(config, sample_format) {
             return Err(BuildStreamError::StreamConfigNotSupported);
         }
 
-        let n_channels = config.channels as usize;
+        let n_channels = config.channels as u32;
+        let buffer_sizes = Self::buffer_sizes(config)?;
+        let inner = Self::create_inner(config).map_err(map_err::<BuildStreamError>)?;
 
-        let buffer_size_frames = match config.buffer_size {
-            BufferSize::Fixed(v) => {
-                if v == 0 {
-                    return Err(BuildStreamError::StreamConfigNotSupported);
-                } else {
-                    v as usize
-                }
-            }
-            BufferSize::Default => DEFAULT_BUFFER_SIZE,
-        };
-        let buffer_size_samples = buffer_size_frames * n_channels;
-        let buffer_time_step_secs = buffer_time_step_secs(buffer_size_frames, config.sample_rate);
+        spawn_local({
+            let inner = inner.clone();
+            async move {
+                let output_stream = async {
+                    let (node, mut params) = Self::create_node(
+                        &inner.ctx,
+                        &buffer_sizes,
+                        n_channels as _,
+                        OutputStream::PROCESSOR_NAME,
+                        OutputStream::PROCESSOR_CODE,
+                    )
+                    .await?;
 
-        let data_callback = Arc::new(Mutex::new(Box::new(data_callback)));
+                    node.set_channel_count_mode(web_sys::ChannelCountMode::Explicit);
+                    node.set_channel_count(n_channels);
 
-        // Create the WebAudio stream.
-        let stream_opts = AudioContextOptions::new();
-        stream_opts.set_sample_rate(config.sample_rate.0 as _);
-        let ctx = AudioContext::new_with_context_options(&stream_opts).map_err(
-            |err| -> BuildStreamError {
-                let description = format!("{:?}", err);
-                let err = BackendSpecificError { description };
-                err.into()
-            },
-        )?;
+                    let destination = inner.ctx.destination();
+                    // If possible, set the destination's channel_count to the given config.channel.
+                    // If not, fallback on the default destination channel_count to keep previous
+                    // behavior and do not return an error.
+                    if n_channels <= destination.max_channel_count() {
+                        destination.set_channel_count(n_channels);
+                    }
 
-        let destination = ctx.destination();
+                    let ctx = inner.ctx.clone();
+                    let _on_process_closure = if params.js_buffer_factor == 1 {
+                        Closure::new(move |_: MessageEvent| {
+                            let now = ctx.current_time();
 
-        // If possible, set the destination's channel_count to the given config.channel.
-        // If not, fallback on the default destination channel_count to keep previous behavior
-        // and do not return an error.
-        if config.channels as u32 <= destination.max_channel_count() {
-            destination.set_channel_count(config.channels as u32);
-        }
-
-        let ctx = Arc::new(ctx);
-
-        // A container for managing the lifecycle of the audio callbacks.
-        let mut on_ended_closures: Vec<Arc<Closure<dyn FnMut()>>> = Vec::new();
-        let sources = Arc::new(RwLock::new(vec![None; NUM_CLOSURES]));
-
-        // A cursor keeping track of the current time at which new frames should be scheduled.
-        let time = Arc::new(RwLock::new(0f64));
-
-        // Create a set of closures / callbacks which will continuously fetch and schedule sample
-        // playback. Starting with two workers, e.g. a front and back buffer so that audio frames
-        // can be fetched in the background.
-        for i in 0..NUM_CLOSURES {
-            let data_callback_handle = data_callback.clone();
-            let ctx_handle = ctx.clone();
-            let sources_handle = sources.clone();
-            let time_handle = time.clone();
-
-            // A set of temporary buffers to be used for intermediate sample transformation steps.
-            let mut temporary_buffer = vec![0f32; buffer_size_samples];
-            let mut temporary_channel_buffer = vec![0f32; buffer_size_frames];
-
-            #[cfg(target_feature = "atomics")]
-            let temporary_channel_array_view: js_sys::Float32Array;
-            #[cfg(target_feature = "atomics")]
-            {
-                let temporary_channel_array = js_sys::ArrayBuffer::new(
-                    (std::mem::size_of::<f32>() * buffer_size_frames) as u32,
-                );
-                temporary_channel_array_view = js_sys::Float32Array::new(&temporary_channel_array);
-            }
-
-            // Create a webaudio buffer which will be reused to avoid allocations.
-            let ctx_buffer = ctx
-                .create_buffer(
-                    config.channels as u32,
-                    buffer_size_frames as u32,
-                    config.sample_rate.0 as f32,
-                )
-                .map_err(|err| -> BuildStreamError {
-                    let description = format!("{:?}", err);
-                    let err = BackendSpecificError { description };
-                    err.into()
-                })?;
-
-            let on_ended_closure = Arc::new_cyclic({
-                |on_ended_closure_handle: &Weak<Closure<dyn FnMut()>>| {
-                    let on_ended_closure_handle = on_ended_closure_handle.clone();
-                    Closure::new(move || {
-                        let now = ctx_handle.current_time();
-                        let time_at_start_of_buffer = {
-                            let time_at_start_of_buffer = time_handle
-                                .read()
-                                .expect("Unable to get a read lock on the time cursor");
-                            // Synchronise first buffer as necessary (eg. keep the time value
-                            // referenced to the context clock).
-                            if *time_at_start_of_buffer > 0.001 {
-                                *time_at_start_of_buffer
-                            } else {
-                                // 25ms of time to fetch the first sample data, increase to avoid
-                                // initial underruns.
-                                now + 0.025
-                            }
-                        };
-
-                        // Populate the sample data into an interleaved temporary buffer.
-                        {
-                            let len = temporary_buffer.len();
-                            let data = temporary_buffer.as_mut_ptr() as *mut ();
-                            let mut data = unsafe { Data::from_parts(data, len, sample_format) };
-                            let mut data_callback = data_callback_handle.lock().unwrap();
-                            let callback = crate::StreamInstant::from_secs_f64(now);
+                            let mut data = unsafe {
+                                Data::from_parts(
+                                    params.temp_buffer.as_mut_ptr() as _,
+                                    params.temp_buffer.len(),
+                                    sample_format,
+                                )
+                            };
+                            let callback = StreamInstant::from_secs_f64(now);
                             let playback =
-                                crate::StreamInstant::from_secs_f64(time_at_start_of_buffer);
-                            let timestamp = crate::OutputStreamTimestamp { callback, playback };
+                                StreamInstant::from_secs_f64(params.time_at_start_of_buffer);
+                            let timestamp = OutputStreamTimestamp { callback, playback };
                             let info = OutputCallbackInfo { timestamp };
-                            (data_callback.deref_mut())(&mut data, &info);
-                        }
+                            (data_callback)(&mut data, &info);
 
-                        // Deinterleave the sample data and copy into the audio context buffer.
-                        // We do not reference the audio context buffer directly e.g. getChannelData.
-                        // As wasm-bindgen only gives us a copy, not a direct reference.
-                        for channel in 0..n_channels {
-                            for i in 0..buffer_size_frames {
-                                temporary_channel_buffer[i] =
-                                    temporary_buffer[n_channels * i + channel];
+                            params.buffer.copy_from(&params.temp_buffer);
+                            params.time_at_start_of_buffer += params.buffer_size_secs;
+                        })
+                    } else {
+                        Closure::new(move |_: MessageEvent| {
+                            let mut now = ctx.current_time();
+
+                            let mut data = unsafe {
+                                Data::from_parts(
+                                    params.temp_buffer.as_mut_ptr() as _,
+                                    params.temp_buffer.len(),
+                                    sample_format,
+                                )
+                            };
+
+                            for i in 0..params.js_buffer_factor {
+                                let callback = StreamInstant::from_secs_f64(now);
+                                let playback =
+                                    StreamInstant::from_secs_f64(params.time_at_start_of_buffer);
+                                let timestamp = OutputStreamTimestamp { callback, playback };
+                                let info = OutputCallbackInfo { timestamp };
+                                (data_callback)(&mut data, &info);
+
+                                params
+                                    .buffer
+                                    .subarray(
+                                        (i * params.temp_buffer.len()) as _,
+                                        ((i + 1) * params.temp_buffer.len()) as _,
+                                    )
+                                    .copy_from(&params.temp_buffer);
+
+                                now += params.buffer_size_secs;
+                                params.time_at_start_of_buffer += params.buffer_size_secs;
                             }
+                        })
+                    };
+                    node.port()?
+                        .set_onmessage(Some(_on_process_closure.as_ref().unchecked_ref()));
+                    node.connect_with_audio_node(&destination)?;
 
-                            #[cfg(not(target_feature = "atomics"))]
-                            {
-                                ctx_buffer
-                                    .copy_to_channel(&mut temporary_channel_buffer, channel as i32)
-                                    .expect(
-                                        "Unable to write sample data into the audio context buffer",
-                                    );
-                            }
-
-                            // copyToChannel cannot be directly copied into from a SharedArrayBuffer,
-                            // which WASM memory is backed by if the 'atomics' flag is enabled.
-                            // This workaround copies the data into an intermediary buffer first.
-                            // There's a chance browsers may eventually relax that requirement.
-                            // See this issue: https://github.com/WebAudio/web-audio-api/issues/2565
-                            #[cfg(target_feature = "atomics")]
-                            {
-                                temporary_channel_array_view
-                                    .copy_from(&mut temporary_channel_buffer);
-                                ctx_buffer
-                                    .unchecked_ref::<ExternalArrayAudioBuffer>()
-                                    .copy_to_channel(&temporary_channel_array_view, channel as i32)
-                                    .expect(
-                                        "Unable to write sample data into the audio context buffer",
-                                    );
-                            }
-                        }
-
-                        // Create an AudioBufferSourceNode, schedule it to playback the reused buffer
-                        // in the future.
-                        let source = ctx_handle
-                            .create_buffer_source()
-                            .expect("Unable to create a WebAudio buffer source");
-                        source.set_buffer(Some(&ctx_buffer));
-                        source
-                            .connect_with_audio_node(&ctx_handle.destination())
-                            .expect(
-                                "Unable to connect the web audio buffer source to the context \
-                                 destination",
-                            );
-                        source
-                            .add_event_listener_with_callback(
-                                "ended",
-                                on_ended_closure_handle
-                                    .upgrade()
-                                    .unwrap()
-                                    .as_ref()
-                                    .as_ref()
-                                    .unchecked_ref(),
-                            )
-                            .expect("Unable to add an 'ended' event listener to the buffer source");
-                        source
-                            .start_with_when(time_at_start_of_buffer)
-                            .expect("Unable to start the WebAudio buffer source");
-                        sources_handle.write().unwrap()[i].replace(source);
-
-                        // Keep track of when the next buffer worth of samples should be played.
-                        *time_handle.write().unwrap() =
-                            time_at_start_of_buffer + buffer_time_step_secs;
+                    Ok(OutputStream {
+                        node,
+                        _on_process_closure,
                     })
+                };
+
+                match output_stream.await {
+                    Ok(s) => {
+                        inner.stream_type.replace(Some(StreamType::Output(s)));
+                    }
+                    Err(err) => {
+                        error_callback(map_err(err));
+                    }
                 }
-            });
+            }
+        });
 
-            on_ended_closures.push(on_ended_closure);
-        }
-
-        Ok(Stream {
-            ctx,
-            sources,
-            on_ended_closures,
-            config: config.clone(),
-            buffer_size_frames,
-            initial_play: AtomicBool::new(true),
-        })
+        Ok(Stream { inner })
     }
 }
 
@@ -408,76 +633,45 @@ impl Stream {
     /// Return the [`AudioContext`](https://developer.mozilla.org/docs/Web/API/AudioContext) used
     /// by this stream.
     pub fn audio_context(&self) -> &AudioContext {
-        &*self.ctx
+        &*self.inner.ctx
     }
 }
 
 impl StreamTrait for Stream {
     fn play(&self) -> Result<(), PlayStreamError> {
-        let window = web_sys::window().unwrap();
-        match self.ctx.resume() {
-            Ok(_) => {
-                if !self.initial_play.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-
-                // Begin webaudio playback, initially scheduling the closures to fire on a timeout
-                // event.
-                let mut offset_ms = 10;
-                let time_step_secs =
-                    buffer_time_step_secs(self.buffer_size_frames, self.config.sample_rate);
-                let time_step_ms = (time_step_secs * 1_000.0) as i32;
-                for on_ended_closure in self.on_ended_closures.iter() {
-                    window
-                        .set_timeout_with_callback_and_timeout_and_arguments_0(
-                            on_ended_closure.as_ref().as_ref().unchecked_ref(),
-                            offset_ms,
-                        )
-                        .unwrap();
-                    offset_ms += time_step_ms;
-                }
-                self.initial_play.store(false, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(err) => {
-                let description = format!("{:?}", err);
-                let err = BackendSpecificError { description };
-                Err(err.into())
-            }
+        match self.inner.ctx.resume() {
+            Ok(_) => Ok(()),
+            Err(err) => Err(map_err(err)),
         }
     }
 
     fn pause(&self) -> Result<(), PauseStreamError> {
-        match self.ctx.suspend() {
+        match self.inner.ctx.suspend() {
             Ok(_) => Ok(()),
-            Err(err) => {
-                let description = format!("{:?}", err);
-                let err = BackendSpecificError { description };
-                Err(err.into())
-            }
+            Err(err) => Err(map_err(err)),
         }
     }
 }
 
-impl Drop for Stream {
+impl Drop for StreamInner {
     fn drop(&mut self) {
         let _ = self.ctx.close();
+    }
+}
 
-        self.sources
-            .read()
-            .unwrap()
-            .iter()
-            .enumerate()
-            .for_each(|(i, source)| {
-                if let Some(source) = source.as_ref() {
-                    source
-                        .remove_event_listener_with_callback(
-                            "ended",
-                            self.on_ended_closures[i].as_ref().as_ref().unchecked_ref(),
-                        )
-                        .unwrap()
-                }
-            });
+impl Drop for InputStream {
+    fn drop(&mut self) {
+        if let Ok(port) = self.node.port() {
+            port.set_onmessage(None);
+        }
+    }
+}
+
+impl Drop for OutputStream {
+    fn drop(&mut self) {
+        if let Ok(port) = self.node.port() {
+            port.set_onmessage(None);
+        }
     }
 }
 
@@ -501,10 +695,19 @@ impl Iterator for Devices {
     }
 }
 
+fn devices() -> Result<MediaDevices, JsValue> {
+    window()
+        .map(|w| w.navigator().media_devices())
+        .unwrap_or(Err("No devices available".into()))
+}
+
 #[inline]
 fn default_input_device() -> Option<Device> {
-    // TODO
-    None
+    if is_webaudio_available() {
+        Some(Device)
+    } else {
+        None
+    }
 }
 
 #[inline]
@@ -518,15 +721,28 @@ fn default_output_device() -> Option<Device> {
 
 // Detects whether the `AudioContext` global variable is available.
 fn is_webaudio_available() -> bool {
-    js_sys::Reflect::get(&js_sys::global(), &JsValue::from("AudioContext"))
+    Reflect::get(&global(), &JsValue::from("AudioContext"))
         .unwrap()
         .is_truthy()
 }
 
+fn map_err<T: From<BackendSpecificError>>(err: JsValue) -> T {
+    let description = format!("{:?}", err);
+    let err = BackendSpecificError { description };
+    err.into()
+}
+
 // Whether or not the given stream configuration is valid for building a stream.
-fn valid_config(conf: &StreamConfig, sample_format: SampleFormat) -> bool {
-    conf.channels <= MAX_CHANNELS
-        && conf.channels >= MIN_CHANNELS
+fn valid_input_config(conf: &StreamConfig, sample_format: SampleFormat) -> bool {
+    conf.channels == InputStream::NUM_CHANNELS
+        && conf.sample_rate <= MAX_SAMPLE_RATE
+        && conf.sample_rate >= MIN_SAMPLE_RATE
+        && sample_format == SUPPORTED_SAMPLE_FORMAT
+}
+
+fn valid_output_config(conf: &StreamConfig, sample_format: SampleFormat) -> bool {
+    conf.channels <= OutputStream::MAX_CHANNELS
+        && conf.channels >= OutputStream::MIN_CHANNELS
         && conf.sample_rate <= MAX_SAMPLE_RATE
         && conf.sample_rate >= MIN_SAMPLE_RATE
         && sample_format == SUPPORTED_SAMPLE_FORMAT
@@ -534,18 +750,4 @@ fn valid_config(conf: &StreamConfig, sample_format: SampleFormat) -> bool {
 
 fn buffer_time_step_secs(buffer_size_frames: usize, sample_rate: SampleRate) -> f64 {
     buffer_size_frames as f64 / sample_rate.0 as f64
-}
-
-#[cfg(target_feature = "atomics")]
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_name = AudioBuffer)]
-    type ExternalArrayAudioBuffer;
-
-    # [wasm_bindgen(catch, method, structural, js_class = "AudioBuffer", js_name = copyToChannel)]
-    pub fn copy_to_channel(
-        this: &ExternalArrayAudioBuffer,
-        source: &js_sys::Float32Array,
-        channel_number: i32,
-    ) -> Result<(), JsValue>;
 }
