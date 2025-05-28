@@ -4,6 +4,7 @@ const CPAL_ASIO_DIR: &str = "CPAL_ASIO_DIR";
 
 fn main() {
     println!("cargo:rerun-if-env-changed={CPAL_ASIO_DIR}");
+    println!("cargo:rustc-check-cfg=cfg(web_sys_unstable_apis)");
 
     // If ASIO directory isn't set silently return early
     // otherwise set the asio config flag
