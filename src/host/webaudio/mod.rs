@@ -6,8 +6,9 @@ use self::js_sys::{global, Array, Float32Array, Reflect, SharedArrayBuffer};
 use self::wasm_bindgen::prelude::*;
 use self::wasm_bindgen::JsCast;
 use self::web_sys::{
-    window, AudioContext, AudioContextOptions, AudioWorkletNode, AudioWorkletNodeOptions, Blob,
-    BlobPropertyBag, MediaDevices, MediaStream, MediaStreamAudioSourceNode, MediaStreamConstraints,
+    console::log_1, window, AudioContext, AudioContextOptions, AudioWorkletNode,
+    AudioWorkletNodeOptions, Blob, BlobPropertyBag, Event, MediaDeviceInfo, MediaDeviceKind,
+    MediaDevices, MediaStream, MediaStreamAudioSourceNode, MediaStreamConstraints,
     MediaTrackConstraints, MessageEvent, Url,
 };
 use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -21,13 +22,25 @@ use crate::{
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
+use std::vec::IntoIter;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
-/// Content is false if the iterator is empty.
-pub struct Devices(bool);
+pub struct Devices(IntoIter<Device>);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Device;
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Device {
+    info: Rc<RefCell<Option<MediaDeviceInfo>>>,
+}
+
+struct DeviceChange {
+    used_devices: Rc<RefCell<Vec<UsedDevice>>>,
+    on_device_change: Option<Closure<dyn Fn(Event)>>,
+}
+
+struct UsedDevice {
+    id: String,
+    error_callback: Box<dyn FnMut(StreamError) + Send + 'static>,
+}
 
 pub struct Host;
 
@@ -137,8 +150,8 @@ struct ClosureParams {
     time_at_start_of_buffer: f64,
 }
 
-pub type SupportedInputConfigs = ::std::vec::IntoIter<SupportedStreamConfigRange>;
-pub type SupportedOutputConfigs = ::std::vec::IntoIter<SupportedStreamConfigRange>;
+pub type SupportedInputConfigs = IntoIter<SupportedStreamConfigRange>;
+pub type SupportedOutputConfigs = IntoIter<SupportedStreamConfigRange>;
 
 const MIN_SAMPLE_RATE: SampleRate = SampleRate(8_000);
 const MAX_SAMPLE_RATE: SampleRate = SampleRate(96_000);
@@ -151,9 +164,106 @@ const DEFAULT_BUFFER_SIZE: usize = 2048;
 const WORKLET_BUFFER_SIZE: usize = 128;
 const SUPPORTED_SAMPLE_FORMAT: SampleFormat = SampleFormat::F32;
 
+thread_local! {
+    static DEVICE_CHANGE: DeviceChange = DeviceChange::new();
+}
+
 impl Host {
     pub fn new() -> Result<Self, crate::HostUnavailable> {
         Ok(Host)
+    }
+
+    pub async fn input_devices_async(&self) -> Result<crate::Devices, DevicesError> {
+        if is_webaudio_available() {
+            Self::devices(Self::input_device_infos().await)
+        } else {
+            Err(webaudio_not_available_err())
+        }
+    }
+
+    pub async fn output_devices_async(&self) -> Result<crate::Devices, DevicesError> {
+        if is_webaudio_available() {
+            Self::devices(Self::output_device_infos().await)
+        } else {
+            Err(webaudio_not_available_err())
+        }
+    }
+
+    pub async fn default_input_device_async(&self) -> Option<crate::Device> {
+        if is_webaudio_available() {
+            Self::default_device(Self::default_input_device_info().await)
+        } else {
+            None
+        }
+    }
+
+    pub async fn default_output_device_async(&self) -> Option<crate::Device> {
+        if is_webaudio_available() {
+            Self::default_device(Self::default_output_device_info().await)
+        } else {
+            None
+        }
+    }
+
+    fn devices(
+        infos: Result<impl Iterator<Item = MediaDeviceInfo>, JsValue>,
+    ) -> Result<crate::Devices, DevicesError> {
+        let devices = infos
+            .map_err(map_err::<DevicesError>)?
+            .map(|i| Device::new(i))
+            .collect::<Vec<_>>();
+        Ok(crate::platform::DevicesInner::WebAudio(Devices(devices.into_iter())).into())
+    }
+
+    fn default_device(info: Option<MediaDeviceInfo>) -> Option<crate::Device> {
+        info.map(|i| crate::platform::DeviceInner::WebAudio(Device::new(i)).into())
+    }
+
+    async fn device_infos() -> Result<impl Iterator<Item = MediaDeviceInfo>, JsValue> {
+        let infos = devices()?.enumerate_devices()?;
+        let infos = JsFuture::from(infos).await?;
+        let infos = infos.unchecked_into::<Array>();
+        Ok(infos.into_iter().map(MediaDeviceInfo::from))
+    }
+
+    async fn input_device_infos() -> Result<impl Iterator<Item = MediaDeviceInfo>, JsValue> {
+        Self::device_infos()
+            .await
+            .map(|i| i.filter(|d| d.kind() == MediaDeviceKind::Audioinput))
+    }
+
+    async fn output_device_infos() -> Result<impl Iterator<Item = MediaDeviceInfo>, JsValue> {
+        Self::device_infos()
+            .await
+            .map(|i| i.filter(|d| d.kind() == MediaDeviceKind::Audiooutput))
+    }
+
+    fn default_device_info(
+        infos: Result<impl Iterator<Item = MediaDeviceInfo>, JsValue>,
+    ) -> Option<MediaDeviceInfo> {
+        if let Ok(infos) = infos {
+            let infos = infos.collect::<Vec<_>>();
+            if let Some(label) = infos.iter().find_map(|i| {
+                let label = i.label();
+                if label.contains(Device::DEFAULT_PREFIX) {
+                    Some(label)
+                } else {
+                    None
+                }
+            }) {
+                let label = label.replace(Device::DEFAULT_PREFIX, "");
+                return infos.into_iter().find(|i| i.label() == label);
+            }
+        }
+        None
+    }
+
+    async fn default_input_device_info() -> Option<MediaDeviceInfo> {
+        Self::default_device_info(Self::input_device_infos().await)
+    }
+
+    async fn default_output_device_info() -> Option<MediaDeviceInfo> {
+        Self::default_device_info(Self::output_device_infos().await)
     }
 }
 
@@ -167,91 +277,37 @@ impl HostTrait for Host {
     }
 
     fn devices(&self) -> Result<Self::Devices, DevicesError> {
-        Devices::new()
+        if is_webaudio_available() {
+            Ok(Devices(vec![Default::default()].into_iter()))
+        } else {
+            Err(webaudio_not_available_err())
+        }
     }
 
     fn default_input_device(&self) -> Option<Self::Device> {
-        default_input_device()
+        if is_webaudio_available() {
+            Some(Device::default())
+        } else {
+            None
+        }
     }
 
     fn default_output_device(&self) -> Option<Self::Device> {
-        default_output_device()
-    }
-}
-
-impl Devices {
-    fn new() -> Result<Self, DevicesError> {
-        Ok(Self::default())
+        if is_webaudio_available() {
+            Some(Device::default())
+        } else {
+            None
+        }
     }
 }
 
 impl Device {
-    #[inline]
-    fn name(&self) -> Result<String, DeviceNameError> {
-        Ok("Default Device".to_owned())
-    }
+    const DEFAULT_PREFIX: &'static str = "Default - ";
 
-    #[inline]
-    fn supported_input_configs(
-        &self,
-    ) -> Result<SupportedInputConfigs, SupportedStreamConfigsError> {
-        let configs = vec![SupportedStreamConfigRange::new(
-            InputStream::NUM_CHANNELS,
-            MIN_SAMPLE_RATE,
-            MAX_SAMPLE_RATE,
-            SupportedBufferSize::Range {
-                min: MIN_BUFFER_SIZE,
-                max: MAX_BUFFER_SIZE,
-            },
-            SUPPORTED_SAMPLE_FORMAT,
-        )];
-        Ok(configs.into_iter())
-    }
-
-    #[inline]
-    fn supported_output_configs(
-        &self,
-    ) -> Result<SupportedOutputConfigs, SupportedStreamConfigsError> {
-        let buffer_size = SupportedBufferSize::Range {
-            min: MIN_BUFFER_SIZE,
-            max: MAX_BUFFER_SIZE,
-        };
-        let configs: Vec<_> = (OutputStream::MIN_CHANNELS..=OutputStream::MAX_CHANNELS)
-            .map(|channels| SupportedStreamConfigRange {
-                channels,
-                min_sample_rate: MIN_SAMPLE_RATE,
-                max_sample_rate: MAX_SAMPLE_RATE,
-                buffer_size: buffer_size.clone(),
-                sample_format: SUPPORTED_SAMPLE_FORMAT,
-            })
-            .collect();
-        Ok(configs.into_iter())
-    }
-
-    #[inline]
-    fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        const EXPECT: &str = "expected at least one valid WebAudio stream config";
-        let config = self
-            .supported_input_configs()
-            .expect(EXPECT)
-            .max_by(|a, b| a.cmp_default_heuristics(b))
-            .unwrap()
-            .with_sample_rate(DEFAULT_SAMPLE_RATE);
-
-        Ok(config)
-    }
-
-    #[inline]
-    fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        const EXPECT: &str = "expected at least one valid WebAudio stream config";
-        let config = self
-            .supported_output_configs()
-            .expect(EXPECT)
-            .max_by(|a, b| a.cmp_default_heuristics(b))
-            .unwrap()
-            .with_sample_rate(DEFAULT_SAMPLE_RATE);
-
-        Ok(config)
+    fn new(info: MediaDeviceInfo) -> Self {
+        Self {
+            info: Rc::new(RefCell::new(Some(info))),
+        }
     }
 
     fn buffer_sizes(config: &StreamConfig) -> Result<BufferSizes, BuildStreamError> {
@@ -275,11 +331,22 @@ impl Device {
         })
     }
 
-    fn create_inner(config: &StreamConfig) -> Result<Rc<StreamInner>, JsValue> {
+    fn create_inner(
+        config: &StreamConfig,
+        #[cfg(web_sys_unstable_apis)] device_id: Option<String>,
+    ) -> Result<Rc<StreamInner>, JsValue> {
         let stream_opts = AudioContextOptions::new();
         stream_opts
             .set_latency_hint(&(WORKLET_BUFFER_SIZE as f32 / config.sample_rate.0 as f32).into());
         stream_opts.set_sample_rate(config.sample_rate.0 as _);
+
+        #[cfg(web_sys_unstable_apis)]
+        {
+            if let Some(device_id) = device_id {
+                stream_opts.set_sink_id(&device_id.into());
+            }
+        }
+
         let ctx = AudioContext::new_with_context_options(&stream_opts)?;
 
         Ok(Rc::new(StreamInner {
@@ -346,31 +413,73 @@ impl DeviceTrait for Device {
 
     #[inline]
     fn name(&self) -> Result<String, DeviceNameError> {
-        Device::name(self)
+        match self.info.borrow().as_ref() {
+            Some(info) => Ok(info.label()),
+            None => Ok("Default Device".into()),
+        }
     }
 
     #[inline]
     fn supported_input_configs(
         &self,
     ) -> Result<Self::SupportedInputConfigs, SupportedStreamConfigsError> {
-        Device::supported_input_configs(self)
+        let configs = vec![SupportedStreamConfigRange::new(
+            InputStream::NUM_CHANNELS,
+            MIN_SAMPLE_RATE,
+            MAX_SAMPLE_RATE,
+            SupportedBufferSize::Range {
+                min: MIN_BUFFER_SIZE,
+                max: MAX_BUFFER_SIZE,
+            },
+            SUPPORTED_SAMPLE_FORMAT,
+        )];
+        Ok(configs.into_iter())
     }
 
     #[inline]
     fn supported_output_configs(
         &self,
     ) -> Result<Self::SupportedOutputConfigs, SupportedStreamConfigsError> {
-        Device::supported_output_configs(self)
+        let buffer_size = SupportedBufferSize::Range {
+            min: MIN_BUFFER_SIZE,
+            max: MAX_BUFFER_SIZE,
+        };
+        let configs: Vec<_> = (OutputStream::MIN_CHANNELS..=OutputStream::MAX_CHANNELS)
+            .map(|channels| SupportedStreamConfigRange {
+                channels,
+                min_sample_rate: MIN_SAMPLE_RATE,
+                max_sample_rate: MAX_SAMPLE_RATE,
+                buffer_size: buffer_size.clone(),
+                sample_format: SUPPORTED_SAMPLE_FORMAT,
+            })
+            .collect();
+        Ok(configs.into_iter())
     }
 
     #[inline]
     fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        Device::default_input_config(self)
+        const EXPECT: &str = "expected at least one valid WebAudio stream config";
+        let config = self
+            .supported_input_configs()
+            .expect(EXPECT)
+            .max_by(|a, b| a.cmp_default_heuristics(b))
+            .unwrap()
+            .with_sample_rate(DEFAULT_SAMPLE_RATE);
+
+        Ok(config)
     }
 
     #[inline]
     fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        Device::default_output_config(self)
+        const EXPECT: &str = "expected at least one valid WebAudio stream config";
+        let config = self
+            .supported_output_configs()
+            .expect(EXPECT)
+            .max_by(|a, b| a.cmp_default_heuristics(b))
+            .unwrap()
+            .with_sample_rate(DEFAULT_SAMPLE_RATE);
+
+        Ok(config)
     }
 
     fn build_input_stream_raw<D, E>(
@@ -391,6 +500,11 @@ impl DeviceTrait for Device {
 
         let n_channels = config.channels as usize;
         let buffer_sizes = Self::buffer_sizes(config)?;
+
+        let device_info = self.info.clone();
+        #[cfg(web_sys_unstable_apis)]
+        let inner = Self::create_inner(config, None).map_err(map_err::<BuildStreamError>)?;
+        #[cfg(not(web_sys_unstable_apis))]
         let inner = Self::create_inner(config).map_err(map_err::<BuildStreamError>)?;
 
         spawn_local({
@@ -401,6 +515,12 @@ impl DeviceTrait for Device {
 
                     let web_stream_constraints = MediaStreamConstraints::new();
                     let track_constraints = MediaTrackConstraints::new();
+                    let mut device_info = device_info.borrow_mut();
+                    if let Some(device_info) = device_info.as_ref() {
+                        track_constraints.set_device_id(&device_info.device_id().into());
+                    } else if let Some(info) = Host::default_input_device_info().await {
+                        device_info.replace(info);
+                    }
                     // TODO: Settings for these?
                     track_constraints.set_auto_gain_control(&false.into());
                     track_constraints.set_echo_cancellation(&false.into());
@@ -498,6 +618,12 @@ impl DeviceTrait for Device {
                         error_callback(map_err(err));
                     }
                 }
+
+                if let Some(device_info) = device_info.borrow().as_ref() {
+                    DEVICE_CHANGE.with(|c| {
+                        c.add_device(device_info.device_id(), error_callback);
+                    });
+                }
             }
         });
 
@@ -523,11 +649,25 @@ impl DeviceTrait for Device {
 
         let n_channels = config.channels as u32;
         let buffer_sizes = Self::buffer_sizes(config)?;
+
+        let device_info = self.info.clone();
+        #[cfg(web_sys_unstable_apis)]
+        let inner =
+            Self::create_inner(config, device_info.borrow().as_ref().map(|i| i.device_id()))
+                .map_err(map_err::<BuildStreamError>)?;
+        #[cfg(not(web_sys_unstable_apis))]
         let inner = Self::create_inner(config).map_err(map_err::<BuildStreamError>)?;
 
         spawn_local({
             let inner = inner.clone();
             async move {
+                let mut device_info = device_info.borrow_mut();
+                if device_info.is_none() {
+                    if let Some(info) = Host::default_output_device_info().await {
+                        device_info.replace(info);
+                    }
+                }
+
                 let output_stream = async {
                     let (node, mut params) = Self::create_node(
                         &inner.ctx,
@@ -622,10 +762,105 @@ impl DeviceTrait for Device {
                         error_callback(map_err(err));
                     }
                 }
+
+                if let Some(device_info) = device_info.as_ref() {
+                    DEVICE_CHANGE.with(|c| {
+                        c.add_device(device_info.device_id(), error_callback);
+                    });
+                }
             }
         });
 
         Ok(Stream { inner })
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        if let Some(info) = self.info.borrow_mut().take() {
+            DEVICE_CHANGE.with(|c| c.remove_device(info.device_id()));
+        }
+    }
+}
+
+impl DeviceChange {
+    fn new() -> Self {
+        let used_devices = Rc::new(RefCell::new(vec![]));
+        let on_device_change = match devices() {
+            Ok(devices) => {
+                let on_device_change = Closure::new({
+                    let used_devices = used_devices.clone();
+                    move |_| {
+                        spawn_local(Self::on_device_change(used_devices.clone()));
+                    }
+                });
+                if let Err(err) = devices.add_event_listener_with_callback(
+                    "devicechange",
+                    on_device_change.as_ref().unchecked_ref(),
+                ) {
+                    log_1(&err);
+                }
+                Some(on_device_change)
+            }
+            Err(err) => {
+                log_1(&err);
+                None
+            }
+        };
+
+        Self {
+            used_devices,
+            on_device_change,
+        }
+    }
+
+    fn add_device(&self, id: String, error_callback: impl FnMut(StreamError) + Send + 'static) {
+        self.used_devices.borrow_mut().push(UsedDevice {
+            id,
+            error_callback: Box::new(error_callback),
+        });
+    }
+
+    fn remove_device(&self, id: String) {
+        self.used_devices.borrow_mut().retain(|d| d.id != id);
+    }
+
+    async fn on_device_change(used_devices: Rc<RefCell<Vec<UsedDevice>>>) {
+        match Host::device_infos().await {
+            Ok(mut infos) => {
+                used_devices.borrow_mut().retain_mut(|d| {
+                    if infos.find(|i| i.device_id() == d.id).is_some() {
+                        true
+                    } else {
+                        (d.error_callback)(StreamError::DeviceNotAvailable);
+                        false
+                    }
+                });
+            }
+            Err(err) => {
+                log_1(&err);
+            }
+        }
+    }
+}
+
+impl Drop for DeviceChange {
+    fn drop(&mut self) {
+        if let Some(on_device_change) = self.on_device_change.take() {
+            match devices() {
+                Ok(devices) => {
+                    if let Err(err) = devices.remove_event_listener_with_callback(
+                        "devicechange",
+                        on_device_change.as_ref().unchecked_ref(),
+                    ) {
+                        log_1(&err);
+                    }
+                }
+                Err(err) => {
+                    log_1(&err);
+                }
+            }
+        }
     }
 }
 
@@ -678,7 +913,7 @@ impl Drop for OutputStream {
 impl Default for Devices {
     fn default() -> Devices {
         // We produce an empty iterator if the WebAudio API isn't available.
-        Devices(is_webaudio_available())
+        Devices(IntoIter::default())
     }
 }
 
@@ -686,12 +921,7 @@ impl Iterator for Devices {
     type Item = Device;
     #[inline]
     fn next(&mut self) -> Option<Device> {
-        if self.0 {
-            self.0 = false;
-            Some(Device)
-        } else {
-            None
-        }
+        self.0.next()
     }
 }
 
@@ -701,29 +931,18 @@ fn devices() -> Result<MediaDevices, JsValue> {
         .unwrap_or(Err("No devices available".into()))
 }
 
-#[inline]
-fn default_input_device() -> Option<Device> {
-    if is_webaudio_available() {
-        Some(Device)
-    } else {
-        None
-    }
-}
-
-#[inline]
-fn default_output_device() -> Option<Device> {
-    if is_webaudio_available() {
-        Some(Device)
-    } else {
-        None
-    }
-}
-
 // Detects whether the `AudioContext` global variable is available.
 fn is_webaudio_available() -> bool {
     Reflect::get(&global(), &JsValue::from("AudioContext"))
         .unwrap()
         .is_truthy()
+}
+
+fn webaudio_not_available_err() -> DevicesError {
+    BackendSpecificError {
+        description: "WebAudio is not available".into(),
+    }
+    .into()
 }
 
 fn map_err<T: From<BackendSpecificError>>(err: JsValue) -> T {
